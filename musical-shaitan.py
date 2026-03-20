@@ -36,14 +36,12 @@ DEFAULT_CONFIG = {
         'TRASH_DIR': r'D:\Music\Duplicates'
     },
     'SETTINGS': {
-        'MAX_WORKERS': 'auto', # 'auto' или число
-        'LOG_FILE': 'music_sorter.log',
-        'FPCALC_PATH': 'D:\\Libs\\fpcalc.exe' # Путь к fpcalc, если не в PATH
+        'MAX_WORKERS': 'auto',  # 'auto' или число
+        'LOG_FILE': 'music_sorter.log'
     }
 }
 
 # Глобальные переменные
-FPCALC_PATH = None
 DEST_DIR = None
 stats_lock = threading.Lock()
 stats = Counter()
@@ -55,7 +53,7 @@ def load_config():
     if Path(CONFIG_FILE).exists():
         config.read(CONFIG_FILE, encoding='utf-8')
     else:
-        # Создаём конфиг по умолчанию
+        # Создаём конфиг по умолчанию (без FPCALC_PATH)
         for section, options in DEFAULT_CONFIG.items():
             config[section] = options
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -129,13 +127,11 @@ def get_quality_score(file_path):
         logging.error(f"Ошибка при получении качества {file_path}: {e}")
         return 0
 
-def get_fingerprint_data(file_path, fpcalc_path=None):
-    """Получение акустического отпечатка с возможностью указания пути к fpcalc."""
+def get_fingerprint_data(file_path):
+    """Получение акустического отпечатка."""
     try:
-        kwargs = {}
-        if fpcalc_path:
-            kwargs['fpcalc'] = fpcalc_path
-        duration, fingerprint = acoustid.fingerprint_file(str(file_path), **kwargs)
+        # Библиотека acoustid автоматически найдёт fpcalc через PATH
+        duration, fingerprint = acoustid.fingerprint_file(str(file_path))
         with stats_lock:
             stats['fingerprint_ok'] += 1
         return {
@@ -144,6 +140,11 @@ def get_fingerprint_data(file_path, fpcalc_path=None):
             'path': file_path,
             'score': get_quality_score(file_path)
         }
+    except acoustid.NoBackendError:
+        logging.error(f"fpcalc не доступен (NoBackendError) для {file_path}. Проверьте наличие в PATH.")
+        with stats_lock:
+            stats['fingerprint_error'] += 1
+        return None
     except Exception as e:
         logging.error(f"Ошибка при создании отпечатка для {file_path}: {e}")
         with stats_lock:
@@ -154,7 +155,7 @@ def organize_file(file_path, dest_root):
     """
     Копирует файл в целевую структуру папок на основе тегов.
     Возвращает путь к скопированному файлу или None при ошибке.
-    """ 
+    """
     try:
         audio = File(file_path, easy=True)
         dest = Path(dest_root)
@@ -205,7 +206,7 @@ def organize_file(file_path, dest_root):
 
             # Копируем файл, пока замок закрыт для других потоков
             shutil.copy2(file_path, final_path)
-        
+
         logging.info(f"Скопирован: {file_path} -> {final_path}")
         with stats_lock:
             stats['organized_ok'] += 1
@@ -255,41 +256,21 @@ def animate_progress(current, total, phase=""):
     sys.stdout.flush()
 
 def main():
-    global FPCALC_PATH, DEST_DIR  # для использования в move_to_trash и других функциях
+    global DEST_DIR
 
-    # Загрузка конфигурации
+    # 1. Загрузка конфигурации
     config = load_config()
     source_dir = config.get('PATHS', 'SOURCE_DIR', fallback=DEFAULT_CONFIG['PATHS']['SOURCE_DIR'])
     dest_dir = config.get('PATHS', 'DEST_DIR', fallback=DEFAULT_CONFIG['PATHS']['DEST_DIR'])
     trash_dir = config.get('PATHS', 'TRASH_DIR', fallback=DEFAULT_CONFIG['PATHS']['TRASH_DIR'])
-    max_workers_setting = config.get('SETTINGS', 'MAX_WORKERS', fallback='auto')
     log_file = config.get('SETTINGS', 'LOG_FILE', fallback='music_sorter.log')
-    fpcalc_path_setting = config.get('SETTINGS', 'FPCALC_PATH', fallback='')
+    max_workers_setting = config.get('SETTINGS', 'MAX_WORKERS', fallback='auto')
 
-    if fpcalc_path_setting:
-        try:
-            fpcalc_path = Path(fpcalc_path_setting).resolve(strict=True)
-            if not fpcalc_path.is_file():
-                raise FileNotFoundError(f"Указанный путь не является файлом: {fpcalc_path_setting}")
-            # Дополнительная проверка на исполняемость (для Linux/Mac)
-            # if not os.access(fpcalc_path, os.X_OK):
-            #     raise PermissionError(f"Нет прав на выполнение: {fpcalc_path_setting}")
-            FPCALC_PATH = str(fpcalc_path)
-        except FileNotFoundError:
-            print(f"Ошибка: файл fpcalc не найден по пути {fpcalc_path_setting}")
-            sys.exit(1)
-        except PermissionError:
-            print(f"Ошибка: недостаточно прав для выполнения {fpcalc_path_setting}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Ошибка при проверке fpcalc: {e}")
-            sys.exit(1)
-
-    # Сохраняем путь для работы функции move_to_trash
-    DEST_DIR = dest_dir
-
-    # Настройка логирования
+    # 3. Настройка логирования
     setup_logging(log_file)
+    logging.info("Скрипт запущен. fpcalc найден в PATH.")
+
+    DEST_DIR = dest_dir
 
     # Определение количества потоков
     if max_workers_setting.lower() == 'auto':
@@ -337,10 +318,8 @@ def main():
     # ---- ШАГ 2: Получение отпечатков ----
     print("Получение акустических отпечатков...")
     fp_results = []
-    # Создаём функцию с фиксированным fpcalc_path
-    get_fingerprint_with_path = partial(get_fingerprint_data, fpcalc_path=FPCALC_PATH)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(get_fingerprint_with_path, p): p for p in organized_paths}
+        futures = {executor.submit(get_fingerprint_data, p): p for p in organized_paths}
         completed = 0
         for future in as_completed(futures):
             data = future.result()
