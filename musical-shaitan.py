@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
     'SETTINGS': {
         'MAX_WORKERS': 'auto', # 'auto' или число
         'LOG_FILE': 'music_sorter.log',
-        'FPCALC_PATH': 'D:\Libs\fpcalc.exe' # Путь к fpcalc, если не в PATH
+        'FPCALC_PATH': 'D:\\Libs\\fpcalc.exe' # Путь к fpcalc, если не в PATH
     }
 }
 
